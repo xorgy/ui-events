@@ -53,6 +53,7 @@
 //! the `xkb` feature, and the `repeat_info` parameters are surfaced through
 //! [`KeyboardEventReducer::repeat_info`] for a consumer that drives key repeat.
 //!
+//! [`Key`]: ui_events::keyboard::Key
 //! [`Key::Named`]: ui_events::keyboard::Key::Named
 //! [`Key::Character`]: ui_events::keyboard::Key::Character
 //! [`NamedKey::Unidentified`]: ui_events::keyboard::NamedKey::Unidentified
@@ -68,15 +69,18 @@ use std::os::unix::fs::FileExt;
 #[cfg(feature = "xkb")]
 use std::os::unix::io::OwnedFd;
 
-use ui_events::keyboard::{Code, Key, KeyState, KeyboardEvent, Location, Modifiers, NamedKey};
+use ui_events::keyboard::{Code, KeyState, KeyboardEvent, Modifiers};
+// Under the `xkb` feature the keymap resolves the logical key and location, so
+// these are named only by the keymap-less fallback.
+#[cfg(not(feature = "xkb"))]
+use ui_events::keyboard::{Key, Location, NamedKey};
+#[cfg(feature = "xkb")]
+use ui_events_xkb::keymap::XkbKeymapState;
+use ui_events_xkb::mapping;
 use wayland_client::WEnum;
 #[cfg(feature = "xkb")]
 use wayland_client::protocol::wl_keyboard::KeymapFormat;
 use wayland_client::protocol::wl_keyboard::{Event, KeyState as WlKeyState};
-#[cfg(feature = "xkb")]
-use xkbcommon::xkb;
-
-use crate::mapping;
 
 /// Key-repeat parameters reported by `wl_keyboard`'s `repeat_info` event.
 ///
@@ -114,7 +118,7 @@ pub struct KeyboardEventReducer {
     repeat_info: Option<RepeatInfo>,
     /// The XKB keymap state, present only under the `xkb` feature.
     #[cfg(feature = "xkb")]
-    xkb: XkbState,
+    xkb: XkbKeymapState,
 }
 
 impl KeyboardEventReducer {
@@ -146,7 +150,7 @@ impl KeyboardEventReducer {
             // authoritative-modifier resolution.
             #[cfg(feature = "xkb")]
             Event::Keymap { format, fd, size } => {
-                self.xkb.set_keymap(*format, fd, *size);
+                self.set_keymap(*format, fd, *size);
                 None
             }
             #[cfg(feature = "xkb")]
@@ -157,8 +161,11 @@ impl KeyboardEventReducer {
                 group,
                 ..
             } => {
+                // Wayland serializes the effective modifier and layout state, so
+                // the masks feed straight in; it reports only the locked layout
+                // group, so the depressed and latched layout are `0`.
                 self.xkb
-                    .update_modifiers(*mods_depressed, *mods_latched, *mods_locked, *group);
+                    .update_mask(*mods_depressed, *mods_latched, *mods_locked, 0, 0, *group);
                 None
             }
             // Without the keymap (no `xkb` feature) the `keymap` event is unused
@@ -226,9 +233,10 @@ impl KeyboardEventReducer {
 
         let code = mapping::code_from_evdev_scancode(scancode);
         // The logical key and location are resolved from the keymap under the
-        // `xkb` feature; otherwise only the physical code is known.
+        // `xkb` feature; otherwise only the physical code is known. The XKB
+        // keycode is the evdev scancode offset by `8`.
         #[cfg(feature = "xkb")]
-        let (key, location) = self.xkb.resolve(scancode, code);
+        let (key, location) = self.xkb.resolve(scancode + 8, code);
         #[cfg(not(feature = "xkb"))]
         let (key, location) = (Key::Named(NamedKey::Unidentified), Location::Standard);
 
@@ -266,44 +274,8 @@ impl KeyboardEventReducer {
     fn leave(&mut self) {
         self.pressed.clear();
     }
-}
 
-/// The XKB keymap state backing logical-key and modifier resolution.
-///
-/// Present only under the `xkb` feature. It owns an xkb context and, once a
-/// `keymap` event has arrived, the derived keyboard state that the `modifiers`
-/// events keep current.
-#[cfg(feature = "xkb")]
-struct XkbState {
-    /// The xkb context used to compile keymaps.
-    context: xkb::Context,
-    /// The keyboard state for the current keymap, once one has been received.
-    state: Option<xkb::State>,
-}
-
-#[cfg(feature = "xkb")]
-impl Default for XkbState {
-    fn default() -> Self {
-        Self {
-            context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
-            state: None,
-        }
-    }
-}
-
-#[cfg(feature = "xkb")]
-impl core::fmt::Debug for XkbState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("XkbState")
-            .field("keymap_loaded", &self.state.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "xkb")]
-impl XkbState {
-    /// Compile the keymap from a `wl_keyboard` `keymap` event and build the
-    /// keyboard state from it.
+    /// Load the keymap from a `wl_keyboard` `keymap` event into the XKB state.
     ///
     /// Only the XKB v1 text format is understood; any other format is ignored,
     /// as is a keymap that fails to compile (the previous state is kept).
@@ -315,6 +287,7 @@ impl XkbState {
     /// (which would need `unsafe`), read exactly `size` bytes from offset `0`
     /// with a positional read, which neither depends on nor disturbs that shared
     /// seek position.
+    #[cfg(feature = "xkb")]
     fn set_keymap(&mut self, format: WEnum<KeymapFormat>, fd: &OwnedFd, size: u32) {
         if !matches!(format, WEnum::Value(KeymapFormat::XkbV1)) {
             return;
@@ -334,67 +307,16 @@ impl XkbState {
         let Ok(keymap) = String::from_utf8(keymap) else {
             return;
         };
-        if let Some(keymap) = xkb::Keymap::new_from_string(
-            &self.context,
-            keymap,
-            xkb::KEYMAP_FORMAT_TEXT_V1,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        ) {
-            self.state = Some(xkb::State::new(&keymap));
-        }
-    }
-
-    /// Apply a `wl_keyboard` `modifiers` event to the keyboard state.
-    ///
-    /// Wayland serializes the modifier and layout state, so the masks are fed in
-    /// directly with [`State::update_mask`]; `group` is the effective (locked)
-    /// layout.
-    ///
-    /// [`State::update_mask`]: xkb::State::update_mask
-    fn update_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        if let Some(state) = self.state.as_mut() {
-            state.update_mask(depressed, latched, locked, 0, 0, group);
-        }
-    }
-
-    /// The modifier set derived from the keymap state, or `None` if no keymap
-    /// has arrived yet.
-    fn modifiers(&self) -> Option<Modifiers> {
-        let state = self.state.as_ref()?;
-        Some(mapping::modifiers_from_active_mods(
-            state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
-            state.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE),
-            state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE),
-            state.mod_name_is_active(xkb::MOD_NAME_LOGO, xkb::STATE_MODS_EFFECTIVE),
-            state.mod_name_is_active(xkb::MOD_NAME_CAPS, xkb::STATE_MODS_EFFECTIVE),
-            state.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE),
-            state.mod_name_is_active(xkb::MOD_NAME_ISO_LEVEL3_SHIFT, xkb::STATE_MODS_EFFECTIVE),
-        ))
-    }
-
-    /// Resolve a key's logical [`Key`] and [`Location`] from the keymap state.
-    ///
-    /// Without a keymap yet, this returns the keymap-less result, so the
-    /// behavior matches a build without the feature until a keymap arrives.
-    fn resolve(&self, scancode: u32, code: Code) -> (Key, Location) {
-        match self.state.as_ref() {
-            Some(state) => {
-                // X11/XKB keycodes are the evdev scancodes offset by 8.
-                let keycode = xkb::Keycode::new(scancode + 8);
-                let keysym = state.key_get_one_sym(keycode);
-                let text = state.key_get_utf8(keycode);
-                (
-                    mapping::key_from_keysym(keysym.raw(), &text),
-                    mapping::location_from_code(code),
-                )
-            }
-            None => (Key::Named(NamedKey::Unidentified), Location::Standard),
-        }
+        self.xkb.set_keymap_from_string(&keymap);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // The keymap-less `key` path names these only without the `xkb` feature, so
+    // the module import is gated; the tests assert on them under both features.
+    use ui_events::keyboard::{Key, Location, NamedKey};
+
     use super::*;
 
     /// `KEY_A` from `linux/input-event-codes.h`.
@@ -565,12 +487,19 @@ mod tests {
         assert_eq!(event.code, Code::Unidentified);
     }
 
-    /// Compile a US-layout keymap state, or `None` if the system has no XKB
-    /// keymap data (in which case the `xkb` integration tests skip).
+    /// Load a US-layout keymap into `reducer` through a `keymap` event.
+    ///
+    /// Returns `false` if the system has no XKB keymap data (in which case the
+    /// `xkb` integration tests skip).
     #[cfg(feature = "xkb")]
-    fn us_keymap_state() -> Option<xkb::State> {
+    fn load_us_keymap(reducer: &mut KeyboardEventReducer) -> bool {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+
+        use xkbcommon::xkb;
+
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_names(
+        let Some(keymap) = xkb::Keymap::new_from_names(
             &context,
             "",
             "",
@@ -578,18 +507,35 @@ mod tests {
             "",
             None,
             xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )?;
-        Some(xkb::State::new(&keymap))
+        ) else {
+            return false; // No XKB keymap data on this system; skip.
+        };
+        // Mirror the wire format: the keymap text followed by a NUL terminator.
+        let mut bytes = keymap
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+            .into_bytes();
+        bytes.push(0);
+        let size = u32::try_from(bytes.len()).expect("keymap size fits in u32");
+
+        let mut file = tempfile::tempfile().expect("create a temp keymap file");
+        file.write_all(&bytes).expect("write the keymap");
+        let fd = OwnedFd::from(file);
+
+        reducer.reduce(&Event::Keymap {
+            format: WEnum::Value(KeymapFormat::XkbV1),
+            fd,
+            size,
+        });
+        true
     }
 
     #[cfg(feature = "xkb")]
     #[test]
     fn xkb_resolves_typed_text() {
-        let Some(state) = us_keymap_state() else {
-            return;
-        };
         let mut reducer = KeyboardEventReducer::default();
-        reducer.xkb.state = Some(state);
+        if !load_us_keymap(&mut reducer) {
+            return;
+        }
 
         // `KEY_A` produces the character 'a' on a US layout.
         let event = reducer
@@ -603,11 +549,10 @@ mod tests {
     #[cfg(feature = "xkb")]
     #[test]
     fn xkb_resolves_named_key_and_side_location() {
-        let Some(state) = us_keymap_state() else {
-            return;
-        };
         let mut reducer = KeyboardEventReducer::default();
-        reducer.xkb.state = Some(state);
+        if !load_us_keymap(&mut reducer) {
+            return;
+        }
 
         // Enter is a named key even though xkb reports a control character for it.
         const KEY_ENTER: u32 = 28;
@@ -627,33 +572,20 @@ mod tests {
     #[cfg(feature = "xkb")]
     #[test]
     fn xkb_modifiers_come_from_keymap_state() {
-        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let Some(keymap) = xkb::Keymap::new_from_names(
-            &context,
-            "",
-            "",
-            "us",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        ) else {
-            return;
-        };
-        let shift_index = keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
-        if shift_index == xkb::MOD_INVALID {
+        let mut reducer = KeyboardEventReducer::default();
+        if !load_us_keymap(&mut reducer) {
             return;
         }
-        let mut reducer = KeyboardEventReducer::default();
-        reducer.xkb.state = Some(xkb::State::new(&keymap));
 
         // The keymap state starts with no active modifiers.
         assert_eq!(reducer.modifiers(), Modifiers::empty());
 
         // Depressing the Shift modifier (as the compositor serializes it through
-        // the `modifiers` event) makes the keymap-derived set report Shift.
+        // the `modifiers` event) makes the keymap-derived set report Shift. Shift
+        // is real-modifier bit 0 in every XKB keymap (the X11 `ShiftMask`).
         reducer.reduce(&Event::Modifiers {
             serial: 0,
-            mods_depressed: 1_u32 << shift_index,
+            mods_depressed: 0x1,
             mods_latched: 0,
             mods_locked: 0,
             group: 0,
@@ -670,6 +602,8 @@ mod tests {
     fn xkb_loads_keymap_from_descriptor_parked_at_end_of_file() {
         use std::io::{Seek, SeekFrom, Write};
         use std::os::fd::OwnedFd;
+
+        use xkbcommon::xkb;
 
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let Some(keymap) = xkb::Keymap::new_from_names(

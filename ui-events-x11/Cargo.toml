@@ -1,0 +1,46 @@
+[package]
+name = "ui-events-x11"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+description = "Bridges X11 (XInput 2 + XKB) input events into ui-events"
+keywords = ["x11", "xinput", "input", "pointer"]
+categories = ["gui"]
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
+
+[features]
+default = ["std"]
+std = ["ui-events/std", "ui-events-xkb/std", "dpi/std"]
+# Workspace no_std CI feature matrix (this crate needs no libm).
+libm = ["ui-events-xkb/libm"]
+# Logical keys, text, and full modifiers via `libxkbcommon`.
+# Without it, only physical codes and held modifier keys.
+xkb = ["ui-events-xkb/xkb", "std"]
+
+# Passed through to `x11rb`. Default is the pure-Rust `RustConnection`
+# (no `libxcb`). These reducers hold no connection; the features only
+# affect what a consumer sharing this `x11rb` can construct.
+#
+# `xcb`: `XCBConnection` (links `libxcb`).
+# `dl-libxcb`: load `libxcb` at run time with `dlopen`.
+xcb = ["x11rb/allow-unsafe-code"]
+dl-libxcb = ["xcb", "x11rb/dl-libxcb"]
+
+[dependencies]
+ui-events.workspace = true
+ui-events-xkb.workspace = true
+dpi.workspace = true
+
+# Reducers are Unix-only. `mapping` compiles everywhere and does not use x11rb.
+[target.'cfg(unix)'.dependencies]
+x11rb = { version = "0.14", default-features = false, features = ["xinput"] }
+
+[lints]
+workspace = true

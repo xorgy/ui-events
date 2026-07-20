@@ -8,6 +8,8 @@ members = [
     "ui-events-wayland",
     "ui-events-web",
     "ui-events-winit",
+    "ui-events-x11",
+    "ui-events-xkb",
     "ui-input-state",
     "ui-theme",
     "examples/simple",
@@ -86,3 +88,4 @@ ui-events-apple-common = { version = "0.3.0", path = "ui-events-apple-common", d
 ui-events-appkit = { version = "0.3.0", path = "ui-events-appkit" }
 ui-events-uikit = { version = "0.3.0", path = "ui-events-uikit" }
 ui-events-web = { version = "0.3.0", path = "ui-events-web" }
+ui-events-xkb = { version = "0.3.0", path = "ui-events-xkb", default-features = false }

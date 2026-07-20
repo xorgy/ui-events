@@ -13,13 +13,19 @@ env:
   RUST_MIN_NO_STD_VER: "1.85"
   # List of packages that will be checked with the minimum supported Rust version.
   # This should be limited to packages that are intended for publishing.
-  RUST_MIN_VER_PKGS: "-p ui-events -p ui-events-apple-common -p ui-events-appkit -p ui-events-uikit -p ui-events-wayland -p ui-events-web -p ui-events-winit -p ui-input-state -p ui-theme"
+  RUST_MIN_VER_PKGS: "-p ui-events -p ui-events-apple-common -p ui-events-appkit -p ui-events-uikit -p ui-events-wayland -p ui-events-web -p ui-events-winit -p ui-events-x11 -p ui-events-xkb -p ui-input-state -p ui-theme"
   # List of packages that will be checked for `no_std` builds.
   # This should be limited to packages that are intended for publishing.
-  RUST_NO_STD_PKGS: "-p ui-events -p ui-events-apple-common -p ui-events-appkit -p ui-events-uikit -p ui-events-wayland -p ui-input-state -p ui-theme"
+  RUST_NO_STD_PKGS: "-p ui-events -p ui-events-apple-common -p ui-events-appkit -p ui-events-uikit -p ui-events-wayland -p ui-events-x11 -p ui-events-xkb -p ui-input-state -p ui-theme"
   # List of features that depend on the standard library and will be excluded from no_std checks.
   # ui-events-wayland's `xkb` reads the keymap fd through `std::fs`, so it implies `std`.
   FEATURES_DEPENDING_ON_STD: "std,default,xkb"
+  # The Wayland and X11 adapters target Linux/Unix, and both reach the `xkb`
+  # feature's logical-key resolution through `ui-events-xkb`, which links the
+  # system libxkbcommon (via `xkbcommon`). That C dependency only builds on the
+  # Linux runners (where CI installs it), so these three crates are excluded from
+  # the wasm and cross-compiled jobs and tested with all features on Linux only.
+  XKB_LINUX_ONLY_EXCLUDE: "--exclude ui-events-wayland --exclude ui-events-x11 --exclude ui-events-xkb"
 
 
 # Rationale
@@ -128,6 +134,12 @@ jobs:
       - name: cargo rdme (ui-events-winit)
         run: cargo rdme --workspace-project=ui-events-winit --heading-base-level=0 --check
 
+      - name: cargo rdme (ui-events-x11)
+        run: cargo rdme --workspace-project=ui-events-x11 --heading-base-level=0 --check
+
+      - name: cargo rdme (ui-events-xkb)
+        run: cargo rdme --workspace-project=ui-events-xkb --heading-base-level=0 --check
+
       - name: cargo rdme (ui-input-state)
         run: cargo rdme --workspace-project=ui-input-state --heading-base-level=0 --check
 
@@ -164,10 +176,22 @@ jobs:
         run: cargo hack clippy ${{ env.RUST_NO_STD_PKGS }} --locked --optional-deps --each-feature --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --features libm --target x86_64-unknown-none -- -D warnings
 
       - name: cargo clippy
+        if: runner.os == 'Linux'
         run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
 
+      # The `xkb` feature's `xkbcommon` compiles only on unix, so its variants
+      # are checked on the Linux runners only (see `XKB_LINUX_ONLY_EXCLUDE`).
+      - name: cargo clippy (non-Linux)
+        if: runner.os != 'Linux'
+        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --exclude-features xkb --features std -- -D warnings
+
       - name: cargo clippy (auxiliary)
+        if: runner.os == 'Linux'
         run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+
+      - name: cargo clippy (auxiliary, non-Linux)
+        if: runner.os != 'Linux'
+        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --exclude-features xkb --features std --tests --benches --examples -- -D warnings
 
   clippy-stable-wasm:
     name: cargo clippy (wasm32)
@@ -193,10 +217,10 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo clippy
-        run: cargo hack clippy --workspace --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
+        run: cargo hack clippy --workspace ${{ env.XKB_LINUX_ONLY_EXCLUDE }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
 
       - name: cargo clippy (auxiliary)
-        run: cargo hack clippy --workspace --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+        run: cargo hack clippy --workspace ${{ env.XKB_LINUX_ONLY_EXCLUDE }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
 
   apple-adapter-targets:
     name: apple adapter targets
@@ -247,19 +271,31 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: install libxkbcommon (Linux)
-        # The ui-events-wayland `xkb` feature, enabled by `--all-features`, links
-        # the system libxkbcommon; `xkb-data` lets its keymap tests run instead of
-        # skipping. Only the Linux job builds and runs this dependency.
+        # The `xkb` feature of the Wayland and X11 adapters, enabled by
+        # `--all-features`, links the system libxkbcommon; `xkb-data` lets their
+        # keymap tests run instead of skipping. Only the Linux job builds and runs
+        # this dependency, so only there are those adapters tested with all
+        # features (see `XKB_LINUX_ONLY_EXCLUDE`).
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev xkb-data
 
       - name: cargo nextest
+        if: runner.os == 'Linux'
         run: cargo nextest run --workspace --locked --all-features --no-fail-fast
 
+      - name: cargo nextest (non-Linux)
+        if: runner.os != 'Linux'
+        run: cargo nextest run --workspace ${{ env.XKB_LINUX_ONLY_EXCLUDE }} --locked --all-features --no-fail-fast
+
       - name: cargo test --doc
+        if: runner.os == 'Linux'
         run: cargo test --doc --workspace --locked --all-features --no-fail-fast
+
+      - name: cargo test --doc (non-Linux)
+        if: runner.os != 'Linux'
+        run: cargo test --doc --workspace ${{ env.XKB_LINUX_ONLY_EXCLUDE }} --locked --all-features --no-fail-fast
 
   test-stable-wasm:
     name: cargo test (wasm32)
@@ -280,7 +316,7 @@ jobs:
 
       # TODO: Find a way to make tests work. Until then the tests are merely compiled.
       - name: cargo test compile
-        run: cargo test --workspace --locked --target wasm32-unknown-unknown --all-features --no-run
+        run: cargo test --workspace ${{ env.XKB_LINUX_ONLY_EXCLUDE }} --locked --target wasm32-unknown-unknown --all-features --no-run
 
   check-msrv:
     name: cargo check (msrv)
@@ -364,7 +400,10 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo check
-        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std
+        # `--exclude-features xkb` for the same reason as the non-wasm MSRV check:
+        # the `xkb` feature links libxkbcommon (via `xkbcommon`), which neither
+        # declares an MSRV nor builds for wasm.
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --exclude-features xkb --features std
 
   miri:
     name: cargo miri
@@ -390,15 +429,16 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: cargo miri
-        # The ui-events-wayland `xkb` feature links the system libxkbcommon (C),
-        # which is unavailable to this cross-compiled job and outside Miri's
-        # reach. Run the rest of the workspace with all features, then the
-        # wayland adapter separately with its default (xkb-free) features so its
-        # mapping and reducer tests still run under Miri.
-        run: cargo miri test --workspace --exclude ui-events-wayland --locked --all-features --target s390x-unknown-linux-gnu --no-fail-fast
+        # The Wayland and X11 adapters' `xkb` feature links the system
+        # libxkbcommon (C), which is unavailable to this cross-compiled job and
+        # outside Miri's reach. Run the rest of the workspace with all features,
+        # then those adapters (and the shared XKB crate) separately with their
+        # default (xkb-free) features so their mapping and reducer tests still run
+        # under Miri.
+        run: cargo miri test --workspace ${{ env.XKB_LINUX_ONLY_EXCLUDE }} --locked --all-features --target s390x-unknown-linux-gnu --no-fail-fast
 
-      - name: cargo miri (ui-events-wayland)
-        run: cargo miri test -p ui-events-wayland --locked --target s390x-unknown-linux-gnu --no-fail-fast
+      - name: cargo miri (Linux/Unix adapters, xkb-free)
+        run: cargo miri test -p ui-events-wayland -p ui-events-x11 -p ui-events-xkb --locked --target s390x-unknown-linux-gnu --no-fail-fast
 
   doc:
     name: cargo doc

@@ -1,0 +1,31 @@
+[package]
+name = "ui-events-xkb"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+description = "Shared XKB keysym and keymap mapping for the ui-events Wayland and X11 backends"
+keywords = ["xkb", "keyboard", "input", "ui-events"]
+categories = ["gui"]
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
+
+[features]
+default = ["std"]
+std = ["ui-events/std"]
+# Workspace no_std CI feature matrix (this crate needs no libm).
+libm = []
+# Keymap resolution via `libxkbcommon`. `mapping` does not use it. Implies `std`.
+xkb = ["dep:xkbcommon", "std"]
+
+[dependencies]
+ui-events.workspace = true
+xkbcommon = { version = "0.9", optional = true, default-features = false }
+
+[lints]
+workspace = true
